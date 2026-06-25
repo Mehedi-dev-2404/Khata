@@ -22,7 +22,7 @@ class Transaction(BaseModel):
     date: datetime = Field(default_factory=datetime.utcnow)
     source_message: Optional[str] = None
     confidence: float = Field(ge=0.0, le=1.0)
-    status: Literal["pending", "confirmed", "flagged"] = "pending"
+    status: Literal["pending", "confirmed", "flagged", "rejected"] = "pending"
 
 
 class MessageLog(BaseModel):

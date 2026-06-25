@@ -1,14 +1,240 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+import json
+
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from pydantic import BaseModel
+
+import config
+import database
+import ledger_csv
+import wassist_client
+from extraction import extract_transaction
+from slack_gate import handle_slack_action, notify_slack_flag
 
 app = FastAPI(title="Khata", description="WhatsApp-native bookkeeping agent")
+
+# ---------------------------------------------------------------------------
+# Wassist inbound payload schema
+# ---------------------------------------------------------------------------
+
+class WassistPayload(BaseModel):
+    message: str
+    image: Optional[str] = None
+    phone_number: str
+    reply_callback: str
+
+
+# ---------------------------------------------------------------------------
+# DB helpers (inline to avoid a separate db_helpers module)
+# ---------------------------------------------------------------------------
+
+def _get_or_create_contact(db, phone: str, name: Optional[str]) -> dict[str, Any]:
+    """Return existing contact row or create one; always returns a dict with 'id'."""
+    result = db.table("contacts").select("*").eq("phone", phone).limit(1).execute()
+    if result.data:
+        row = result.data[0]
+        # opportunistically update name if we got one and didn't have one
+        if name and not row.get("name"):
+            db.table("contacts").update({"name": name}).eq("id", row["id"]).execute()
+            row["name"] = name
+        return row
+    new_row = {
+        "id": str(uuid.uuid4()),
+        "phone": phone,
+        "name": name or phone,
+        "business_id": "demo",
+    }
+    db.table("contacts").insert(new_row).execute()
+    return new_row
+
+
+def _get_contact_history(db, contact_id: str) -> list[dict]:
+    """Return last 5 transactions for a contact, oldest first."""
+    result = (
+        db.table("transactions")
+        .select("amount,direction,date,status,confidence")
+        .eq("contact_id", contact_id)
+        .order("date", desc=True)
+        .limit(5)
+        .execute()
+    )
+    return list(reversed(result.data or []))
+
+
+def _insert_transaction(db, contact_id: str, extraction: dict[str, Any],
+                        message: str, status: str) -> dict[str, Any]:
+    row = {
+        "id": str(uuid.uuid4()),
+        "contact_id": contact_id,
+        "amount": extraction["amount"],
+        "direction": extraction.get("direction") or "owed_to_business",
+        "date": datetime.now(timezone.utc).isoformat(),
+        "source_message": message,
+        "confidence": extraction["confidence"],
+        "status": status,
+    }
+    db.table("transactions").insert(row).execute()
+    return row
+
+
+def _insert_flag(db, transaction_id: str, reason: str) -> str:
+    flag_id = str(uuid.uuid4())
+    db.table("flags").insert({
+        "id": flag_id,
+        "transaction_id": transaction_id,
+        "reason": reason,
+        "resolved": False,
+    }).execute()
+    return flag_id
 
 
 @app.get("/health")
 def health():
-    from database import get_client
-    db_ok = get_client() is not None
+    db_ok = database.get_client() is not None
     return {"status": "ok", "db_connected": db_ok}
+
+
+# ---------------------------------------------------------------------------
+# Wassist webhook
+# ---------------------------------------------------------------------------
+
+@app.post("/webhook")
+async def webhook(payload: WassistPayload):
+    """Receive an inbound WhatsApp message from Wassist and process it."""
+
+    db = database.get_client()
+
+    # ---- 1. Resolve contact ---------------------------------------------------
+    contact: Optional[dict] = None
+    history: list[dict] = []
+
+    if db:
+        try:
+            contact = _get_or_create_contact(db, payload.phone_number, None)
+            history = _get_contact_history(db, contact["id"])
+        except Exception as exc:
+            print(f"[webhook] DB contact lookup failed: {exc}")
+
+    # ---- 2. Extract transaction -----------------------------------------------
+    extraction = extract_transaction(
+        message=payload.message,
+        contact_phone=payload.phone_number,
+        contact_history=history,
+    )
+
+    amount: float = extraction.get("amount") or 0.0
+    confidence: float = extraction.get("confidence") or 0.0
+    direction: str = extraction.get("direction") or "owed_to_business"
+    contact_name: Optional[str] = (
+        extraction.get("contact_name")
+        or (contact.get("name") if contact else None)
+        or payload.phone_number
+    )
+
+    # ---- 3. Routing: auto-confirm vs flag ------------------------------------
+    needs_flag = (
+        confidence < config.CONFIDENCE_THRESHOLD
+        or amount >= config.REMINDER_THRESHOLD_GBP
+    )
+
+    if not needs_flag:
+        # --- Happy path: write and confirm ------------------------------------
+        status = "confirmed"
+        transaction: Optional[dict] = None
+
+        if db and contact:
+            try:
+                transaction = _insert_transaction(
+                    db, contact["id"], extraction, payload.message, status
+                )
+            except Exception as exc:
+                print(f"[webhook] DB transaction insert failed: {exc}")
+
+        if transaction:
+            ledger_row = {**transaction, "contact_name": contact_name}
+            try:
+                ledger_csv.sync_transaction(ledger_row)
+            except Exception as exc:
+                print(f"[webhook] ledger_csv sync failed: {exc}")
+
+        direction_phrase = (
+            f"£{amount:.0f} owed to you from {contact_name}"
+            if direction == "owed_to_business"
+            else f"£{amount:.0f} paid out to {contact_name}"
+        )
+        reply = wassist_client.send_webhook_response(
+            f"Got it — noted {direction_phrase}. Ledger updated ✓"
+        )
+        return JSONResponse(content=reply)
+
+    else:
+        # --- Flag path: write as flagged, alert Slack, stay silent -----------
+        transaction = None
+        flag_id: Optional[str] = None
+
+        if db and contact:
+            try:
+                transaction = _insert_transaction(
+                    db, contact["id"], extraction, payload.message, "flagged"
+                )
+                reason = (
+                    "low_confidence" if confidence < config.CONFIDENCE_THRESHOLD
+                    else "high_value"
+                )
+                flag_id = _insert_flag(db, transaction["id"], reason)
+            except Exception as exc:
+                print(f"[webhook] DB flag insert failed: {exc}")
+
+        if transaction:
+            ledger_row = {**transaction, "contact_name": contact_name}
+            try:
+                ledger_csv.sync_transaction(ledger_row)
+            except Exception as exc:
+                print(f"[webhook] ledger_csv flagged sync failed: {exc}")
+
+        if transaction and flag_id:
+            try:
+                notify_slack_flag(
+                    transaction={**transaction, "contact_name": contact_name},
+                    flag_id=flag_id,
+                )
+            except Exception as exc:
+                print(f"[webhook] Slack notify failed: {exc}")
+
+        return JSONResponse(content=wassist_client.silent_response())
+
+
+# ---------------------------------------------------------------------------
+# Slack interactive actions (button clicks on flagged-transaction messages)
+# ---------------------------------------------------------------------------
+
+@app.post("/slack/actions")
+async def slack_actions(request: Request):
+    """Receive Slack interactive component payloads (approve/reject buttons).
+
+    Slack posts application/x-www-form-urlencoded with a single ``payload``
+    field containing a JSON string. Requires python-multipart to be installed.
+    """
+    form = await request.form()
+    raw = form.get("payload", "")
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return Response(status_code=400, content="Invalid payload")
+
+    try:
+        handle_slack_action(payload)
+    except Exception as exc:
+        print(f"[/slack/actions] Error handling action: {exc}")
+
+    # Slack expects a 200 quickly; return empty body to clear the spinner
+    return Response(status_code=200)
 
 
 @app.get("/ledger", response_class=HTMLResponse)
