@@ -1,6 +1,9 @@
 import os
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()  # loads .env into os.environ before any getenv() calls
+
 ANTHROPIC_API_KEY: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
 SUPABASE_URL: Optional[str] = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY: Optional[str] = os.getenv("SUPABASE_SERVICE_KEY")
