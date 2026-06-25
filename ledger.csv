@@ -1,3 +1,4 @@
 Contact,Amount,Direction,Date,Status,Confidence,Source Message,Transaction ID
 John,40,owed_to_business,2026-06-25T19:11:35.387444+00:00,confirmed,0.95,John owes me £40 for the delivery,ebca1377-0f21-4b5c-a795-d446adcc6530
 Sarah,25,owed_to_business,2026-06-25T19:24:37.594763+00:00,confirmed,0.95,Sarah owes me £25 for the haircut,e2519652-8093-4a11-98fa-c4b1709d41a0
+Sarah,25,owed_to_business,2026-06-25T20:21:51.397309+00:00,confirmed,0.95,Sarah owes me £25 for the haircut,23d7b7e4-9e4f-4271-9790-bfc8ecfb4d56
