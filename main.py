@@ -16,6 +16,7 @@ import ledger_csv
 import wassist_client
 from extraction import extract_transaction
 from slack_gate import handle_slack_action, notify_slack_flag
+from digest import send_digest
 
 app = FastAPI(title="Khata", description="WhatsApp-native bookkeeping agent")
 
@@ -235,6 +236,35 @@ async def slack_actions(request: Request):
 
     # Slack expects a 200 quickly; return empty body to clear the spinner
     return Response(status_code=200)
+
+
+# ---------------------------------------------------------------------------
+# Chase / reminder trigger
+# ---------------------------------------------------------------------------
+
+@app.post("/chase/run")
+def chase_run():
+    """Manually trigger an overdue-reminder pass. No auth — demo only."""
+    import chase
+    db = database.get_client()
+    summary = chase.run_chase(db)
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Digest — manual trigger
+# ---------------------------------------------------------------------------
+
+@app.post("/digest/run")
+def digest_run():
+    """Manually trigger the end-of-day digest.
+
+    Builds a summary of today's activity, formats it via Claude Sonnet, and
+    pushes it to Slack (and WhatsApp if OWNER_PHONE_NUMBER is set).
+    """
+    db = database.get_client()
+    result = send_digest(db)
+    return JSONResponse(content=result)
 
 
 @app.get("/ledger", response_class=HTMLResponse)

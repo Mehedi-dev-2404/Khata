@@ -141,13 +141,7 @@ def _update_transaction_status(transaction_id: str, status: str) -> Optional[dic
 
 
 def _sync_ledgers(transaction: dict) -> None:
-    """Push the updated transaction to all ledger sinks (sheets + CSV)."""
-    try:
-        from sheets_sync import sync_transaction as sheets_sync
-        sheets_sync(transaction)
-    except Exception as exc:
-        print(f"[SlackGate] sheets_sync error: {exc}")
-
+    """Push the updated transaction to the CSV ledger."""
     try:
         from ledger_csv import sync_transaction as csv_sync
         csv_sync(transaction)
